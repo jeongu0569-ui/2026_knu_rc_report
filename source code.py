@@ -1,0 +1,379 @@
+import threading
+import time
+import cv2
+import numpy as np
+import json
+import os
+from pop import Pilot, LiDAR, Cds
+from IPython.display import display
+import PIL.Image
+import io
+
+# ====================================================
+# 1. ⚙️ 하드웨어 및 다른 폴더의 JSON 데이터 로드
+# ====================================================
+folder_path = os.path.expanduser("~/Project/python/notebook/Untitled Folder")
+steer_json_path = os.path.join(folder_path, "steering_calibration.json")
+cds_json_path = os.path.join(folder_path, "cds_dnn_weights.json")
+
+# ⚖️ [ESC 조향 캘리브레이션 로드]
+try:
+    with open(steer_json_path, "r", encoding="utf-8") as f:
+        calib_data = json.load(f)
+    BASE_GYRO = float(calib_data["base_gyro"])
+    USABLE_GYRO = float(calib_data["usable_gyro"])
+    ZERO_CORRECTION = float(calib_data["zero_correction"])
+    print(f"🎯 조향 보정 로드 성공! [직진 자이로]: {BASE_GYRO:.2f} | [가용 회전량]: {USABLE_GYRO:.2f}")
+except Exception as e:
+    print(f"⚠️ 조향 JSON 로드 실패(기본값 가동): {e}")
+    BASE_GYRO = 0.0
+    USABLE_GYRO = 1347.14
+    ZERO_CORRECTION = 0.0
+
+# 🧠 [초경량 DNN 가중치 로드 및 행렬 구성]
+try:
+    with open(cds_json_path, "r", encoding="utf-8") as f:
+        weights_data = json.load(f)
+    
+    W_0 = np.array(weights_data["W_0"])
+    b_0 = np.array(weights_data["b_0"])
+    W_1 = np.array(weights_data["W_1"])
+    b_1 = np.array(weights_data["b_1"])
+    W_2 = np.array(weights_data["W_2"])
+    b_2 = np.array(weights_data["b_2"])
+    W_3 = np.array(weights_data["W_3"])
+    b_3 = np.array(weights_data["b_3"])
+    
+    print("🧠 DNN 가중치 로드 성공! 텐서플로우 없이 실시간 예측 엔진 구동 시작.")
+    dnn_loaded = True
+except Exception as e:
+    print(f"⚠️ DNN JSON 로드 실패: {e}")
+    dnn_loaded = False
+
+# 💡 하드웨어 기기들 기동
+try:
+    cds_sensor = Cds(7)
+    print("💡 7번 핀 조도 센서(Cds) 가동 완료.")
+except Exception as e:
+    print(f"⚠️ 조도 센서 초기화 실패: {e}")
+    cds_sensor = None
+
+try:
+    LED = Pilot.PWM(1, 0x5c)
+    LED.setFreq(50)
+    for channel in range(4):
+        LED.setDuty(channel, 0)
+except Exception as e:
+    print(f"⚠️ LED 하드웨어 초기화 실패: {e}")
+    LED = None
+
+try:
+    car
+except NameError:
+    print("⚙️ 오토카 객체 초기화...")
+    car = Pilot.get_Control()
+
+print("📡 LiDAR 센서 모터 기동 중...")
+try:
+    lidar = LiDAR.Rplidar()
+    lidar.connect()
+    lidar.startMotor()
+except Exception as e:
+    print(f"⚠️ LiDAR 연결 실패: {e}")
+    lidar = None
+
+print("📸 비동기 카메라 시스템 로드...")
+cam = Pilot.Camera(width=300, height=300)
+
+# 전역 공유 자원 구조
+shared_data = {
+    "drive_mode": "MANUAL",    
+    "manual_cmd": "stop",      
+    "ai_steer_value": 0.0,     
+    "latest_frame": None,      
+    "is_emergency": False,     
+    "nearest_obstacle": 9999.0,
+    "current_lux": 1000.0      
+}
+
+data_lock = threading.Lock()
+is_running = True
+
+# ====================================================
+# 2. ⚡ 텐서플로우 없는 순수 NumPy DNN 예측 함수
+# ====================================================
+def predict_lux_numpy(cds_value):
+    if not dnn_loaded:
+        return 1000.0 if cds_value > 500 else 100.0
+        
+    def relu(x):
+        return np.maximum(0, x)
+        
+    x = np.array([[cds_value]], dtype=float)
+    
+    h1 = relu(np.dot(x, W_0) + b_0)
+    h2 = relu(np.dot(h1, W_1) + b_1)
+    h3 = relu(np.dot(h2, W_2) + b_2)
+    out = np.dot(h3, W_3) + b_3
+    
+    return float(out[0][0])
+
+# ====================================================
+# 3. 📡 독립 LiDAR 장애물 감시 스레드 (30cm)
+# ====================================================
+def lidar_scan_thread_loop():
+    global is_running
+    while is_running:
+        if lidar is None:
+            time.sleep(0.1)
+            continue
+        try:
+            vectors = lidar.getVectors() 
+            collision_detected = False
+            min_dist = 9999.0
+            for v in vectors:
+                degree = v[0]
+                distance = v[1]
+                if degree <= 60 or degree >= 300:
+                    if 0.0 < distance <= 300.0:
+                        collision_detected = True
+                        if distance < min_dist:
+                            min_dist = distance
+            with data_lock:
+                shared_data["is_emergency"] = collision_detected
+                shared_data["nearest_obstacle"] = min_dist if collision_detected else 9999.0
+        except Exception as e:
+            pass
+        time.sleep(0.02)
+
+# ====================================================
+# 4. 🌙 초스피드 오토 라이트 스레드
+# ====================================================
+def auto_headlight_thread_loop():
+    global is_running
+    print("🌙 [Auto Light] 초경량 실시간 DNN 조도 예측 스레드 가동...")
+    while is_running:
+        if cds_sensor is None or LED is None:
+            time.sleep(0.5)
+            continue
+        try:
+            raw_cds = cds_sensor.readAverage()
+            predicted_lux = predict_lux_numpy(raw_cds)
+            
+            with data_lock:
+                shared_data["current_lux"] = predicted_lux
+            
+            # 💡 [요구사항 반영] 조도 임계값 450 Lux 기준 라이트 제어
+            if predicted_lux <= 450.0:
+                LED.setDuty(0, 90)
+                LED.setDuty(1, 90)
+            else:
+                LED.setDuty(0, 0)
+                LED.setDuty(1, 0)
+                
+        except Exception as e:
+            pass
+        time.sleep(0.1)
+
+# ====================================================
+# 5. 🧠 백그라운드 OpenCV 라인 연산 스레드
+# ====================================================
+def vision_opencv_thread_loop():
+    global is_running
+    print("👁️ [OpenCV Vision] 라인 추적 연산 개시...")
+    while is_running:
+        try:
+            for _ in range(4): 
+                _ = cam.value
+            
+            frame = cam.value
+            if frame is not None:
+                h, w, _ = frame.shape
+                roi_top = int(h * 0.6)
+                roi = frame[roi_top:h, 0:w]
+                
+                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                _, thresh = cv2.threshold(gray, 90, 255, cv2.THRESH_BINARY_INV)
+                M = cv2.moments(thresh)
+                steer_x = 0.0
+                
+                draw_frame = frame.copy()
+                center_screen = int(w / 2)
+                cv2.line(draw_frame, (center_screen, 0), (center_screen, h), (255, 0, 0), 2)
+                cv2.line(draw_frame, (0, roi_top), (w, roi_top), (0, 255, 0), 2)
+                
+                if M["m00"] > 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"]) + roi_top
+                    error = (cx - center_screen) / center_screen
+                    steer_x = max(-1.0, min(1.0, error))
+                    cv2.circle(draw_frame, (cx, cy), 8, (0, 0, 255), -1)
+                    cv2.line(draw_frame, (center_screen, cy), (cx, cy), (0, 255, 255), 2)
+                
+                with data_lock:
+                    emergency = shared_data["is_emergency"]
+                    obs_dist = shared_data["nearest_obstacle"]
+                    lux_val = shared_data["current_lux"]
+                
+                # 💡 [요구사항 반영] 오버레이 색상 기준 또한 450 Lux로 수정
+                cv2.putText(draw_frame, f"Light: {lux_val:.1f} Lux", (10, h - 15), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0) if lux_val > 450.0 else (0, 165, 255), 2)
+                
+                if emergency:
+                    if LED is not None:
+                        LED.setDuty(2, 90)
+                        LED.setDuty(3, 90)
+                    cv2.rectangle(draw_frame, (0, 0), (w, h), (0, 0, 255), 10)
+                    cv2.putText(draw_frame, f"EMERGENCY! {obs_dist:.0f}mm", (15, 45), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 3)
+                else:
+                    cv2.putText(draw_frame, f"Steer: {steer_x:+.2f}", (10, 30), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    if LED is not None:
+                        LED.setDuty(2, 0)
+                        LED.setDuty(3, 0)
+                
+                with data_lock:
+                    shared_data["ai_steer_value"] = steer_x
+                    shared_data["latest_frame"] = draw_frame
+        except Exception as e:
+            pass
+        time.sleep(0.02)
+
+# ====================================================
+# 6. 🎨 비동기 주피터 디스플레이 전용 스레드
+# ====================================================
+def display_thread_loop():
+    global is_running
+    display_handle = display(None, display_id=True)
+    while is_running:
+        try:
+            with data_lock:
+                draw_frame = shared_data["latest_frame"]
+            if draw_frame is not None:
+                _, encoded_img = cv2.imencode('.jpg', draw_frame)
+                img_bytes = io.BytesIO(encoded_img.tobytes())
+                pil_img = PIL.Image.open(img_bytes)
+                display_handle.update(pil_img)
+        except Exception as e:
+            pass
+        time.sleep(0.06)
+
+# ====================================================
+# 7. ⚡ 50Hz 메인 제어 루프
+# ====================================================
+def main_control_loop():
+    global is_running
+    print("\n🏎️ [Main Control] 사령탑 가동 (OpenCV 라인 추적 + 자이로 ESC 능동 자세 제어)")
+    
+    current_speed = 40
+    car.setSpeed(current_speed)
+    
+    while is_running:
+        with data_lock:
+            mode = shared_data["drive_mode"]
+            cmd = shared_data["manual_cmd"]
+            ai_steer = shared_data["ai_steer_value"]
+            emergency = shared_data["is_emergency"]
+        
+        if mode == "AUTO" and emergency:
+            car.stop()
+            car.steering = ZERO_CORRECTION
+            time.sleep(0.02)
+            continue
+            
+        if mode == "AUTO" and not emergency:
+            car.forward(current_speed)
+            base_target_steer = ai_steer * 1.3
+            
+            current_gyro = car.getGyro("z")
+            expected_gyro = BASE_GYRO + (base_target_steer * USABLE_GYRO)
+            gyro_error = current_gyro - expected_gyro
+            
+            esc_counter_value = -(gyro_error / USABLE_GYRO)
+            esc_stabilizer = esc_counter_value / 3.0
+            
+            final_steering = base_target_steer + ZERO_CORRECTION + esc_stabilizer
+            car.steering = max(-1.0, min(1.0, final_steering))
+                
+        elif mode == "MANUAL":
+            if cmd == "forward": car.steering = ZERO_CORRECTION; car.forward(current_speed)
+            elif cmd == "backward": car.steering = ZERO_CORRECTION; car.backward(current_speed)
+            elif cmd == "left": car.steering = -1.0; car.forward(current_speed)
+            elif cmd == "right": car.steering = 1.0; car.forward(current_speed)
+            elif cmd == "stop": car.stop(); car.steering = ZERO_CORRECTION
+            
+        time.sleep(0.02)
+
+# ====================================================
+# 8. 인프라 실행 및 안전 종료 컨트롤러 (Main Thread)
+# ====================================================
+if __name__ == "__main__":
+    is_running = True
+    
+    threading.Thread(target=main_control_loop, daemon=True).start()
+    threading.Thread(target=vision_opencv_thread_loop, daemon=True).start()
+    threading.Thread(target=display_thread_loop, daemon=True).start()
+    threading.Thread(target=lidar_scan_thread_loop, daemon=True).start()
+    threading.Thread(target=auto_headlight_thread_loop, daemon=True).start()
+    
+    time.sleep(1.0)
+    
+    print("\n=== 🕹️ 오토카 통합 제어 콘솔 (종료 버그 수정 완료 버전) ===")
+    print("수동 명령어: w(전진), s(후진), a(좌회전), d(우회전), x(정지)")
+    print("모드 변경: auto(자율주행), manual(수동모드)")
+    print("종료: q")
+    print("==============================================================\n")
+    
+    while is_running:
+        user_input = input("🎮 명령을 입력하세요: ").strip().lower()
+        if user_input == 'q':
+            is_running = False
+            break
+        with data_lock:
+            if user_input == 'auto':
+                shared_data["drive_mode"] = "AUTO"
+                print("🔄 [모드 변경] 자율주행(AUTO + ESC + Auto Light 활성화) 시작!")
+            elif user_input == 'manual':
+                shared_data["drive_mode"] = "MANUAL"
+                shared_data["manual_cmd"] = "stop"
+                print("🔄 [모드 변경] 수동(MANUAL) 모드로 전환!")
+            elif shared_data["drive_mode"] == "MANUAL":
+                if user_input == 'w': shared_data["manual_cmd"] = "forward"
+                elif user_input == 's': shared_data["manual_cmd"] = "backward"
+                elif user_input == 'a': shared_data["manual_cmd"] = "left"
+                elif user_input == 'd': shared_data["manual_cmd"] = "right"
+                elif user_input == 'x': shared_data["manual_cmd"] = "stop"
+
+    # ====================================================
+    # 🧹 [안전 종료 클린업] 메인 프로세스가 끝날 때 확실하게 실행
+    # ====================================================
+    print("\n🛑 오토카 종료 시퀀스를 시작합니다...")
+    time.sleep(0.3) # 각 백그라운드 스레드가 정지 플래그(is_running=False)를 감지할 대기시간 확보
+    
+    # 1. 주행 시스템 정지
+    try:
+        car.stop()
+        car.steering = ZERO_CORRECTION
+        print("✅ 오토카 주행 정지 완료.")
+    except Exception as e:
+        print(f"⚠️ 주행 정지 실패: {e}")
+
+    # 2. 모든 LED 강제 소등 (0, 1번 앞 LED 포함)
+    if LED is not None:
+        try:
+            for channel in range(4):
+                LED.setDuty(channel, 0)
+            print("✅ 전방 및 후방 LED 전원 소등 완료.")
+        except Exception as e:
+            print(f"⚠️ LED 소등 실패: {e}")
+
+    # 3. LiDAR 모터 정지
+    if lidar:
+        try:
+            lidar.stopMotor()
+            print("✅ LiDAR 모터 기동 정지 완료.")
+        except Exception as e:
+            print(f"⚠️ LiDAR 정지 실패: {e}")
+
+    print("\n🏎️ 모든 센서와 디바이스가 안전하게 클린업되었습니다. 프로그램을 완전히 종료합니다.")
