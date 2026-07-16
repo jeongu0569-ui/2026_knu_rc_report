@@ -1,3 +1,6 @@
+https://docs.google.com/presentation/d/1DfW1d5YgbADr5JexpXPkpHMC0roCoYWNDut-XK6IOhM/edit?slide=id.g3f4ed6b2e7f_2_0#slide=id.g3f4ed6b2e7f_2_0
+
+
 # 2026_knu_rc_report
 team5
 
