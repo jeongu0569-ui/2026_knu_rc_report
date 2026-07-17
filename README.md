@@ -1,4 +1,4 @@
-https://docs.google.com/presentation/d/1DfW1d5YgbADr5JexpXPkpHMC0roCoYWNDut-XK6IOhM/edit?slide=id.g3f4ed6b2e7f_2_0#slide=id.g3f4ed6b2e7f_2_0
+https://docs.google.com/presentation/d/19iFtB_ulhAN0WZlP02_iIVIAsNMR4CXOHRILWsH7Ebo/edit?slide=id.p1#slide=id.p1
 
 
 # 2026_knu_rc_report
