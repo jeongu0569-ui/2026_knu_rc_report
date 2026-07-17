@@ -1,0 +1,260 @@
+RC Smart Drive
+OpenCV 기반 자율주행 RC카 및 LiDAR 장애물 감지 시스템
+1. 프로젝트 개요
+프로젝트명
+
+RC Smart Drive
+
+개발 목적
+
+RC카가 지정된 트랙을 따라 자율주행을 수행하며, 주행 중 전방의 장애물을 LiDAR를 이용하여 감지하고 차량을 즉시 정지시키며 음성으로 사용자에게 위험 상황을 안내하는 시스템을 구현하였다.
+
+또한 OpenCV 기반 영상처리와 LiDAR 센서, 조도센서, LED, TTS 기능을 하나의 시스템으로 통합하여 실제 자율주행 차량의 핵심 기능을 RC카에서 구현하는 것을 목표로 한다.
+
+2. 개발 환경
+구분	내용
+OS	Ubuntu 22.04
+Language	Python
+IDE	Visual Studio Code
+영상처리	OpenCV
+수학연산	NumPy
+오디오	PyAudio
+센서	LiDAR, CDS
+플랫폼	AutoCar Prime NX
+Thread	Python Threading
+3. 주요 기능
+OpenCV 기반 노란색 차선 인식
+실시간 자율주행(Line Tracing)
+LiDAR 기반 전방 장애물 감지
+장애물 발견 시 차량 정지
+TTS(음성 안내) 기능
+조도센서를 이용한 자동 헤드라이트
+DNN 기반 조도(Lux) 예측
+Manual / Auto 주행모드 전환
+ESC 기반 조향 보정
+PD 제어를 이용한 안정적인 차선 추종
+실시간 카메라 영상 출력
+멀티스레드 기반 병렬 제어 시스템
+4. 시스템 구성
+구성 요소	역할
+Camera	노란색 차선 인식
+OpenCV Vision	차선 중심 계산 및 조향값 생성
+Main Controller	차량 제어
+LiDAR	장애물 감지
+CDS Sensor	조도 측정
+DNN Engine	조도 예측(Lux 변환)
+LED	자동 전조등 제어
+Audio Engine	TTS 및 효과음 출력
+AutoCar API	모터 및 조향 제어
+5. 하드웨어 구성
+AutoCar Prime NX
+USB Camera
+RPLidar
+CDS 조도센서
+LED
+Speaker
+개발용 PC
+6. 시스템 동작 과정
+Camera
+    │
+    ▼
+OpenCV 영상처리
+    │
+    ▼
+차선 중심 계산
+    │
+    ▼
+PD Steering Controller
+    │
+    ▼
+AutoCar Motor Control
+
+동시에
+
+LiDAR
+   │
+   ▼
+장애물 감지
+   │
+   ▼
+Emergency Stop
+   │
+   ▼
+TTS 음성 출력
+
+그리고
+
+CDS Sensor
+    │
+    ▼
+DNN Lux Prediction
+    │
+    ▼
+LED Auto Headlight
+7. 소프트웨어 구조
+Main Thread
+
+├── Main Control Thread
+│
+├── OpenCV Vision Thread
+│
+├── LiDAR Thread
+│
+├── Auto Headlight Thread
+│
+├── Audio Thread
+│
+└── Display Thread
+
+모든 기능을 독립적인 Thread에서 수행하여 카메라 영상처리, LiDAR 스캔, 음성 출력, 차량 제어가 동시에 실행되도록 구현하였다.
+
+8. 핵심 알고리즘
+(1) OpenCV 차선 인식
+
+카메라에서 영상을 입력받아 ROI(Region of Interest)를 설정한 후 Gaussian Blur를 적용하여 노이즈를 제거하였다.
+
+HSV 색 공간으로 변환한 뒤 노란색 영역만 추출하여 Binary Image를 생성하였다.
+
+영상의 Moment를 계산하여 차선의 중심 좌표를 구하고 화면 중앙과의 오차(Error)를 계산하였다.
+
+이 값을 이용하여 RC카의 Steering 값을 생성하였다.
+
+(2) PD Steering Control
+
+단순 P 제어만 사용할 경우 차량이 S자 형태로 흔들리는 문제가 발생하였다.
+
+이를 해결하기 위해
+
+P(Proportional)
+D(Derivative)
+
+제어를 함께 적용하였다.
+
+조향 오차뿐 아니라 오차 변화율을 함께 계산하여 과도한 Steering을 방지하고 안정적인 주행이 가능하도록 개선하였다.
+
+(3) ESC Steering Calibration
+
+차량의 자이로 센서를 이용하여 현재 회전량을 측정하고
+
+초기에 측정한 직진 기준값(BASE_GYRO)과 비교하여 Steering Offset을 보정하였다.
+
+이를 통해 차량의 기계적인 편차를 줄여 직진 성능을 향상시켰다.
+
+(4) LiDAR 장애물 감지
+
+LiDAR에서 수신한 360° 거리 정보를 분석하였다.
+
+전방
+
+300°
+60°
+
+범위만 검사하도록 하여 연산량을 감소시켰다.
+
+40cm 이내 장애물이 존재하면
+
+Emergency Mode
+
+로 전환하여 차량을 정지시켰다.
+
+(5) Audio Thread
+
+장애물을 감지하면
+
+obstacle_alert.wav
+
+파일을 Audio Queue에 등록한다.
+
+별도의 Audio Thread에서 Queue를 순차적으로 처리하여
+
+메인 제어가 중단되지 않도록 구현하였다.
+
+(6) DNN 기반 조도 예측
+
+TensorFlow를 사용하지 않고
+
+학습된 Weight를 JSON 파일로 저장하였다.
+
+NumPy만 이용하여
+
+Input
+
+↓
+
+Hidden Layer
+
+↓
+
+Hidden Layer
+
+↓
+
+Output
+
+순으로 연산하여 Lux 값을 계산하였다.
+
+예측된 Lux가
+
+450Lux 이하
+
+이면
+
+자동으로 전조등을 켜도록 구현하였다.
+
+9. 실행 결과
+노란색 차선을 인식하여 자율주행 성공
+LiDAR를 이용한 장애물 감지 성공
+장애물 발견 시 차량 정지 성공
+음성 안내 출력 성공
+자동 헤드라이트 동작 성공
+Manual / Auto 전환 성공
+실시간 영상 출력 성공
+10. 개발 중 문제점
+OpenCV 차선 추종
+
+초기에는 차선을 따라가기는 하지만
+
+영상 처리 속도와 조향 응답 지연으로 인해
+
+차량이 S자 형태로 주행하였다.
+
+이를 해결하기 위해
+
+ROI 축소
+Gaussian Blur 최적화
+PD 제어 적용
+Steering Gain 조정
+
+을 수행하여 흔들림을 감소시켰다.
+
+오디오 출력
+
+초기에는 음성 출력 시
+
+차량 제어가 멈추는 문제가 발생하였다.
+
+이를 해결하기 위해
+
+Queue 기반 Audio Thread를 추가하여
+
+비동기 방식으로 음성을 출력하도록 개선하였다.
+
+LiDAR
+
+LiDAR가 360° 데이터를 모두 처리하여
+
+CPU 사용률이 증가하였다.
+
+전방 각도만 검사하도록 변경하여
+
+처리 속도를 향상시켰다.
+
+11. 향후 개선 방향
+YOLO 기반 객체 인식 추가
+차선 변경 기능 구현
+장애물 회피 알고리즘 적용
+Dashboard(pywebview) 연동
+Flask API 기반 원격 제어
+GPS 또는 Visual Odometry 기반 위치 추정
+주행 데이터 CSV 저장 및 통계 분석
+음성 명령(STT) 기능 추가
